@@ -1,6 +1,13 @@
 """
 Voice Cloning Web App — Stateless, local-only, no persistence.
 Uses Coqui TTS XTTS-v2 for zero-shot voice cloning.
+
+Voice-similarity tuning (v2):
+  • Minimal preprocessing — mono conversion only; NO trimming, NO normalisation
+  • XTTS-v2 handles its own internal resampling to 22 050 Hz
+  • Reference audio up to 30 s used via gpt_cond_len=30 & max_ref_len=30
+  • Low temperature (0.15) for deterministic, voice-faithful output
+  • Language selectable from frontend (critical for non-English voices)
 """
 
 from __future__ import annotations
@@ -40,10 +47,18 @@ log = logging.getLogger("voice-clone")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB (larger samples = better cloning)
 ALLOWED_CONTENT_TYPES = {"audio/wav", "audio/x-wav", "audio/wave", "audio/mpeg", "audio/mp3"}
-TARGET_SR = 22050
+XTTS_SR = 22050  # write pre-processed WAV at this rate; XTTS loads at 22050 internally
+REF_MIN_SEC = 3  # minimum seconds of speech
+REF_MAX_SEC = 30  # XTTS can condition on up to 30 s of reference
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Languages supported by XTTS-v2
+SUPPORTED_LANGS = {
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru",
+    "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
+}
 
 # ---------------------------------------------------------------------------
 # Global model holder (loaded once at startup)
@@ -106,43 +121,47 @@ def _validate_upload(file: UploadFile, raw_bytes: bytes) -> None:
     if len(raw_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large ({len(raw_bytes)} bytes). Max is {MAX_UPLOAD_BYTES} bytes (2 MB).",
+            detail=f"File too large ({len(raw_bytes)} bytes). Max is {MAX_UPLOAD_BYTES} bytes (10 MB).",
         )
 
 
-def _preprocess_audio(raw_bytes: bytes, content_type: str) -> np.ndarray:
+def _preprocess_speaker(raw_bytes: bytes, content_type: str) -> np.ndarray:
     """
-    Convert uploaded audio to 22 050 Hz mono float32 numpy array.
-    Steps: decode → mono → resample → normalize → trim silence.
+    Prepare speaker reference audio for XTTS-v2 embedding extraction.
+
+    MINIMAL preprocessing for best voice similarity:
+      1. Convert to mono (required by XTTS).
+      2. Resample to 22 050 Hz (matching XTTS internal load_sr).
+      3. NO silence trimming — preserves natural speech rhythm/dynamics.
+      4. NO normalisation — XTTS expects natural loudness.
+      5. Cap at REF_MAX_SEC (30 s) — XTTS uses gpt_cond_len internally.
+      6. Ensure at least REF_MIN_SEC seconds of audio.
     """
     # --- Decode with pydub (handles both WAV and MP3) ---
     fmt = "mp3" if "mp3" in content_type or "mpeg" in content_type else "wav"
     seg = AudioSegment.from_file(io.BytesIO(raw_bytes), format=fmt)
 
-    # → mono, export as raw PCM in a WAV container so librosa can read it
+    # → mono
     seg = seg.set_channels(1)
     buf = io.BytesIO()
     seg.export(buf, format="wav")
     buf.seek(0)
 
-    # --- Load with librosa for resampling + analysis ---
-    y, sr = librosa.load(buf, sr=TARGET_SR, mono=True)
+    # --- Resample with librosa (mono, 22050 Hz) ---
+    y, sr = librosa.load(buf, sr=XTTS_SR, mono=True)
 
-    # --- Peak-normalize ---
-    peak = np.max(np.abs(y))
-    if peak > 0:
-        y = y / peak
+    duration = len(y) / XTTS_SR
 
-    # --- Trim silence ---
-    y_trimmed, _ = librosa.effects.trim(y, top_db=25)
+    # --- Cap to max reference length (XTTS handles sub-selection internally) ---
+    if duration > REF_MAX_SEC:
+        y = y[: int(REF_MAX_SEC * XTTS_SR)]
+        duration = REF_MAX_SEC
 
     log.info(
-        "Preprocessed audio: %.2fs → %.2fs @ %d Hz",
-        len(y) / TARGET_SR,
-        len(y_trimmed) / TARGET_SR,
-        TARGET_SR,
+        "Speaker ref: %.1fs @ %d Hz (no trim, max %ds)",
+        duration, XTTS_SR, REF_MAX_SEC,
     )
-    return y_trimmed
+    return y
 
 
 def _write_temp_wav(audio: np.ndarray, sr: int) -> str:
@@ -174,64 +193,100 @@ async def index():
 @app.post("/clone")
 async def clone_voice(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="WAV or MP3 voice sample (max 2 MB)"),
+    file: UploadFile = File(..., description="WAV or MP3 voice sample (max 10 MB)"),
     text: str = Form(..., min_length=1, max_length=1000, description="Text to synthesize"),
+    language: str = Form("en", description="Language code (e.g. en, hi, es, fr, de)"),
 ):
     """
-    Accept a voice sample + text, clone the voice, return generated audio.
+    Accept a voice sample + text + language, clone the voice, return generated audio.
     No files are persisted after the response is sent.
     """
 
-    # 1. Read & validate -------------------------------------------------------
+    # 1. Validate language -----------------------------------------------------
+    lang = language.strip().lower()
+    if lang not in SUPPORTED_LANGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{lang}'. Supported: {', '.join(sorted(SUPPORTED_LANGS))}",
+        )
+
+    # 2. Read & validate -------------------------------------------------------
     raw_bytes = await file.read()
     _validate_upload(file, raw_bytes)
-    log.info("Received upload: %s (%d bytes), text length: %d", file.filename, len(raw_bytes), len(text))
+    log.info(
+        "Received upload: %s (%d bytes), text length: %d, lang: %s",
+        file.filename, len(raw_bytes), len(text), lang,
+    )
 
-    # 2. Preprocess ------------------------------------------------------------
+    # 3. Preprocess speaker reference ------------------------------------------
     try:
-        processed = _preprocess_audio(raw_bytes, file.content_type or "")
+        processed = _preprocess_speaker(raw_bytes, file.content_type or "")
     except Exception as exc:
         log.error("Audio preprocessing failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=422, detail=f"Could not process audio: {exc}")
 
-    # Minimum duration check (~1 second)
-    if len(processed) / TARGET_SR < 1.0:
-        raise HTTPException(status_code=400, detail="Voice sample too short. Provide at least 1 second of speech.")
+    duration = len(processed) / XTTS_SR
+    if duration < REF_MIN_SEC:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voice sample too short ({duration:.1f}s). Provide at least {REF_MIN_SEC}s of clear speech.",
+        )
 
     # Limit text length on CPU to avoid multi-minute hangs
     device = str(next(_tts_model.synthesizer.tts_model.parameters()).device)
-    if device == "cpu" and len(text) > 300:
+    if device == "cpu" and len(text) > 500:
         raise HTTPException(
             status_code=400,
             detail=f"Text too long for CPU mode ({len(text)} chars). "
-                   f"Keep it under 300 characters, or use a CUDA GPU for longer text.",
+                   f"Keep it under 500 characters, or use a CUDA GPU for longer text.",
         )
 
-    # 3. Write preprocessed speaker audio to a temp file (XTTS needs a path) ---
-    speaker_path = _write_temp_wav(processed, TARGET_SR)
+    # 4. Write preprocessed speaker audio to a temp file (XTTS needs a path) ---
+    speaker_path = _write_temp_wav(processed, XTTS_SR)
     output_path: Optional[str] = None
 
-    def _run_synthesis(speaker: str, out: str, txt: str) -> None:
-        """Run the blocking TTS call (called from thread pool)."""
+    def _run_synthesis(speaker: str, out: str, txt: str, lng: str) -> None:
+        """
+        Run XTTS-v2 synthesis with fine-tuned parameters for maximum voice similarity.
+
+        Key XTTS-v2 kwargs forwarded via tts_to_file → synthesize → inference:
+          • gpt_cond_len=30      — use up to 30 s of reference for GPT conditioning
+          • gpt_cond_chunk_len=6 — stable chunk size for latent extraction
+          • max_ref_len=30       — use up to 30 s for decoder conditioning
+          • temperature=0.15     — very low = deterministic, voice-faithful
+          • repetition_penalty=5.0 — moderate, avoids repetitive artifacts
+          • top_p=0.8            — nucleus sampling threshold
+          • top_k=50             — top-k sampling
+        """
         _tts_model.tts_to_file(
             text=txt,
             speaker_wav=speaker,
-            language="en",
+            language=lng,
             file_path=out,
+            # --- Conditioning (how much reference audio the model uses) ---
+            gpt_cond_len=30,            # use full reference for GPT conditioning
+            gpt_cond_chunk_len=6,       # stable chunking
+            max_ref_len=30,             # use full reference for decoder
+            # --- Generation (how closely it follows the voice) ---
+            temperature=0.15,           # low = closer to reference voice
+            repetition_penalty=5.0,     # prevent repetitive artifacts
+            top_p=0.8,                  # nucleus sampling
+            top_k=50,                   # top-k sampling
+            length_penalty=1.0,         # no length bias
         )
 
     try:
-        # 4. Synthesize with XTTS-v2 (in thread pool to avoid blocking) -------
-        log.info("Starting voice cloning synthesis…")
+        # 5. Synthesize with XTTS-v2 (in thread pool to avoid blocking) -------
+        log.info("Starting voice cloning synthesis (lang=%s)…", lang)
         output_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            _synth_executor, _run_synthesis, speaker_path, output_path, text
+            _synth_executor, _run_synthesis, speaker_path, output_path, text, lang
         )
         log.info("Synthesis complete → %s", output_path)
 
-        # 5. Read generated audio into memory ----------------------------------
+        # 6. Read generated audio into memory ----------------------------------
         gen_audio, gen_sr = sf.read(output_path)
         out_buf = io.BytesIO()
         sf.write(out_buf, gen_audio, gen_sr, format="WAV")
@@ -243,13 +298,13 @@ async def clone_voice(
         log.error("Synthesis failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Voice synthesis failed: {exc}")
     finally:
-        # 6. Schedule cleanup of ALL temp files --------------------------------
+        # 7. Schedule cleanup of ALL temp files --------------------------------
         paths_to_clean = [speaker_path]
         if output_path:
             paths_to_clean.append(output_path)
         background_tasks.add_task(_cleanup, *paths_to_clean)
 
-    # 7. Stream the WAV back ---------------------------------------------------
+    # 8. Stream the WAV back ---------------------------------------------------
     return StreamingResponse(
         out_buf,
         media_type="audio/wav",
