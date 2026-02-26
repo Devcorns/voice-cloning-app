@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Cloning — XTTS v2</title>
+<style>
+  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2d3040;--accent:#6c63ff;--accent-hover:#5a52d9;--text:#e2e4ed;--muted:#8b8fa3;--danger:#f44;--radius:10px}
+  *,*::after,*::before{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:100%;max-width:520px;padding:36px 32px;box-shadow:0 8px 32px rgba(0,0,0,.45)}
+  h1{font-size:1.5rem;margin-bottom:4px}
+  .sub{color:var(--muted);font-size:.85rem;margin-bottom:28px}
+  label{display:block;font-size:.82rem;color:var(--muted);margin-bottom:6px;margin-top:18px}
+  .drop-zone{border:2px dashed var(--border);border-radius:var(--radius);padding:28px 16px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;position:relative}
+  .drop-zone:hover,.drop-zone.over{border-color:var(--accent);background:rgba(108,99,255,.06)}
+  .drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
+  .drop-zone .icon{font-size:2rem;margin-bottom:6px}
+  .file-name{margin-top:8px;font-size:.8rem;color:var(--accent);word-break:break-all}
+  textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:12px;font-size:.95rem;resize:vertical;min-height:90px;font-family:inherit}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .char-count{text-align:right;font-size:.7rem;color:var(--muted);margin-top:4px}
+  button[type=submit]{margin-top:24px;width:100%;padding:14px;border:none;border-radius:var(--radius);background:var(--accent);color:#fff;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}
+  button[type=submit]:hover:not(:disabled){background:var(--accent-hover)}
+  button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
+  .status{margin-top:16px;text-align:center;font-size:.85rem;min-height:22px}
+  .status.error{color:var(--danger)}
+  .status.ok{color:#4caf50}
+  .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #audioResult{margin-top:16px;width:100%;display:none}
+  #audioResult audio{width:100%}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎙️ Voice Cloning</h1>
+  <p class="sub">Upload a voice sample &amp; enter text. Powered by XTTS v2 — 100% local.</p>
+
+  <form id="form" enctype="multipart/form-data">
+    <!-- File upload -->
+    <label for="file">Voice Sample (WAV / MP3 · max 2 MB)</label>
+    <div class="drop-zone" id="dropZone">
+      <div class="icon">📁</div>
+      <div>Drag &amp; drop or <strong>click</strong> to select</div>
+      <input type="file" id="file" name="file" accept=".wav,.mp3,audio/wav,audio/mpeg" required />
+      <div class="file-name" id="fileName"></div>
+    </div>
+
+    <!-- Text input -->
+    <label for="text">Text to Speak</label>
+    <textarea id="text" name="text" maxlength="1000" placeholder="Type the sentence you want cloned…" required></textarea>
+    <div class="char-count"><span id="charCount">0</span> / 1000</div>
+
+    <!-- Submit -->
+    <button type="submit" id="btn">Clone Voice</button>
+  </form>
+
+  <div class="status" id="status"></div>
+  <div id="audioResult"><audio controls id="audioPlayer"></audio></div>
+</div>
+
+<script>
+(() => {
+  const form     = document.getElementById('form');
+  const fileIn   = document.getElementById('file');
+  const fileName = document.getElementById('fileName');
+  const textIn   = document.getElementById('text');
+  const charCnt  = document.getElementById('charCount');
+  const btn      = document.getElementById('btn');
+  const status   = document.getElementById('status');
+  const result   = document.getElementById('audioResult');
+  const player   = document.getElementById('audioPlayer');
+  const dropZone = document.getElementById('dropZone');
+
+  // --- File name display ---
+  fileIn.addEventListener('change', () => {
+    fileName.textContent = fileIn.files[0]?.name || '';
+  });
+
+  // --- Drag & drop ---
+  ['dragenter','dragover'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.add('over'); }));
+  ['dragleave','drop'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.remove('over'); }));
+  dropZone.addEventListener('drop', ev => {
+    if (ev.dataTransfer.files.length) {
+      fileIn.files = ev.dataTransfer.files;
+      fileName.textContent = ev.dataTransfer.files[0].name;
+    }
+  });
+
+  // --- Char counter ---
+  textIn.addEventListener('input', () => { charCnt.textContent = textIn.value.length; });
+
+  // --- Submit ---
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!fileIn.files.length) return;
+
+    // UI lock
+    btn.disabled = true;
+    btn.textContent = 'Processing…';
+    status.className = 'status';
+    status.innerHTML = '<span class="spinner"></span>Cloning voice — this may take 30–120 s on CPU…';
+    result.style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('file', fileIn.files[0]);
+    fd.append('text', textIn.value);
+
+    // 5-minute timeout for CPU synthesis
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
+    try {
+      const res = await fetch('/clone', { method: 'POST', body: fd, signal: controller.signal });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Unknown error');
+      }
+
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+
+      // Show player
+      player.src = url;
+      result.style.display = 'block';
+
+      // Auto-download
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'cloned_voice.wav';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      status.className = 'status ok';
+      status.textContent = '✔ Done — audio downloaded.';
+    } catch (err) {
+      status.className = 'status error';
+      if (err.name === 'AbortError') {
+        status.textContent = '✖ Request timed out (5 min). Try shorter text or use a GPU.';
+      } else {
+        status.textContent = '✖ ' + err.message;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      btn.disabled = false;
+      btn.textContent = 'Clone Voice';
+    }
+  });
+})();
+</script>
+</body>
+</html>
