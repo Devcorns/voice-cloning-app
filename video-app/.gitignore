@@ -1,0 +1,15 @@
+# Model weights (large binary files)
+models/*.pth
+models/*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# Temp files
+*.tmp
