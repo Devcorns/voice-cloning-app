@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Auto-accept Coqui XTTS license (non-commercial CPML)
 os.environ["COQUI_TOS_AGREED"] = "1"
 from pathlib import Path
+import re
 from typing import Optional
 
 import librosa
@@ -164,6 +165,66 @@ def _preprocess_speaker(raw_bytes: bytes, content_type: str) -> np.ndarray:
     return y
 
 
+# ---------------------------------------------------------------------------
+# Text helpers — handle num2words limitations for unsupported languages
+# ---------------------------------------------------------------------------
+try:
+    from num2words import num2words as _num2words
+except ImportError:
+    _num2words = None
+
+# Languages where num2words is known to crash (NotImplementedError)
+_NUM2WORDS_UNSUPPORTED: set[str] = set()
+
+
+def _safe_expand_numbers(text: str, lang: str) -> str:
+    """Replace digit sequences with spoken words *before* XTTS tokenises.
+
+    For languages supported by num2words we do the conversion here so XTTS
+    doesn't have to.  For unsupported languages we simply remove the digits
+    (XTTS can't pronounce raw '24' correctly anyway) or transliterate them.
+    """
+    if _num2words is None:
+        # num2words not installed — just strip digits
+        return re.sub(r"\d+", "", text).strip()
+
+    def _replace(m: re.Match) -> str:
+        number_str = m.group(0)
+        if lang in _NUM2WORDS_UNSUPPORTED:
+            # Already known unsupported — spell out digit-by-digit
+            return " ".join(_digit_word(d, lang) for d in number_str)
+        try:
+            return _num2words(int(number_str), lang=lang)
+        except (NotImplementedError, OverflowError):
+            # Mark language as unsupported for future calls
+            _NUM2WORDS_UNSUPPORTED.add(lang)
+            log.warning("num2words does not support lang '%s'; using digit spelling", lang)
+            return " ".join(_digit_word(d, lang) for d in number_str)
+
+    return re.sub(r"\d+", _replace, text)
+
+
+# Digit-to-word maps for languages without num2words support
+_HINDI_DIGITS = {
+    "0": "शून्य", "1": "एक", "2": "दो", "3": "तीन", "4": "चार",
+    "5": "पाँच", "6": "छह", "7": "सात", "8": "आठ", "9": "नौ",
+}
+_ARABIC_DIGITS = {
+    "0": "صفر", "1": "واحد", "2": "اثنان", "3": "ثلاثة", "4": "أربعة",
+    "5": "خمسة", "6": "ستة", "7": "سبعة", "8": "ثمانية", "9": "تسعة",
+}
+
+
+def _digit_word(digit: str, lang: str) -> str:
+    """Return the spoken word for a single digit character."""
+    if lang == "hi":
+        return _HINDI_DIGITS.get(digit, digit)
+    if lang == "ar":
+        return _ARABIC_DIGITS.get(digit, digit)
+    # Fallback: just keep the raw digit character
+    return digit
+
+
 def _write_temp_wav(audio: np.ndarray, sr: int) -> str:
     """Write numpy audio to a named temp WAV file and return its path."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -241,7 +302,11 @@ async def clone_voice(
                    f"Keep it under 500 characters, or use a CUDA GPU for longer text.",
         )
 
-    # 4. Write preprocessed speaker audio to a temp file (XTTS needs a path) ---
+    # 4. Pre-expand numbers (num2words crashes for Hindi, Arabic, etc.) ------
+    text = _safe_expand_numbers(text, lang)
+    log.info("Text after number expansion (%d chars): %s", len(text), text[:120])
+
+    # 5. Write preprocessed speaker audio to a temp file (XTTS needs a path) ---
     speaker_path = _write_temp_wav(processed, XTTS_SR)
     output_path: Optional[str] = None
 
