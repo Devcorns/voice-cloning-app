@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+torch>=2.1
+torchaudio>=2.1
+opencv-python-headless>=4.8
+librosa>=0.10.2
+soundfile>=0.12
+numpy>=1.26
+pydantic>=2.0

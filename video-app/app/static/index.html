@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lip-Sync Video — Wav2Lip</title>
+<style>
+  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2d3040;--accent:#6c63ff;--accent-hover:#5a52d9;--text:#e2e4ed;--muted:#8b8fa3;--danger:#f44;--radius:10px}
+  *,*::after,*::before{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:100%;max-width:560px;padding:36px 32px;box-shadow:0 8px 32px rgba(0,0,0,.45)}
+  h1{font-size:1.5rem;margin-bottom:4px}
+  .sub{color:var(--muted);font-size:.85rem;margin-bottom:28px}
+  label{display:block;font-size:.82rem;color:var(--muted);margin-bottom:6px;margin-top:18px}
+  .drop-zone{border:2px dashed var(--border);border-radius:var(--radius);padding:24px 16px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;position:relative}
+  .drop-zone:hover,.drop-zone.over{border-color:var(--accent);background:rgba(108,99,255,.06)}
+  .drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
+  .drop-zone .icon{font-size:2rem;margin-bottom:4px}
+  .file-name{margin-top:6px;font-size:.78rem;color:var(--accent);word-break:break-all}
+  button[type=submit]{margin-top:28px;width:100%;padding:14px;border:none;border-radius:var(--radius);background:var(--accent);color:#fff;font-size:1rem;font-weight:600;cursor:pointer;transition:background .2s}
+  button[type=submit]:hover:not(:disabled){background:var(--accent-hover)}
+  button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
+  .status{margin-top:16px;text-align:center;font-size:.85rem;min-height:22px}
+  .status.error{color:var(--danger)}
+  .status.ok{color:#4caf50}
+  .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #videoResult{margin-top:16px;width:100%;display:none}
+  #videoResult video{width:100%;border-radius:var(--radius);background:#000}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎬 Lip-Sync Video</h1>
+  <p class="sub">Upload a face + audio → get a lip-synced MP4. Powered by Wav2Lip — 100 % local.</p>
+
+  <form id="form" enctype="multipart/form-data">
+    <!-- Face upload -->
+    <label for="face">Face Image (JPG/PNG · ≤ 5 MB) or Video (MP4 · ≤ 10 MB)</label>
+    <div class="drop-zone" id="dropFace">
+      <div class="icon">🧑</div>
+      <div>Drag &amp; drop or <strong>click</strong> to select face</div>
+      <input type="file" id="face" name="face" accept=".jpg,.jpeg,.png,.mp4,.avi,.webm,image/*,video/*" required />
+      <div class="file-name" id="faceName"></div>
+    </div>
+
+    <!-- Audio upload -->
+    <label for="audio">Voice Audio (WAV / MP3 · ≤ 5 MB)</label>
+    <div class="drop-zone" id="dropAudio">
+      <div class="icon">🎤</div>
+      <div>Drag &amp; drop or <strong>click</strong> to select audio</div>
+      <input type="file" id="audio" name="audio" accept=".wav,.mp3,audio/*" required />
+      <div class="file-name" id="audioName"></div>
+    </div>
+
+    <button type="submit" id="btn">Generate Lip-Sync Video</button>
+  </form>
+
+  <div class="status" id="status"></div>
+  <div id="videoResult"><video controls id="videoPlayer"></video></div>
+</div>
+
+<script>
+(() => {
+  const form     = document.getElementById('form');
+  const faceIn   = document.getElementById('face');
+  const audioIn  = document.getElementById('audio');
+  const faceName = document.getElementById('faceName');
+  const audioName= document.getElementById('audioName');
+  const btn      = document.getElementById('btn');
+  const status   = document.getElementById('status');
+  const result   = document.getElementById('videoResult');
+  const player   = document.getElementById('videoPlayer');
+
+  // ── Drag & drop helpers ──
+  function setupDrop(zone, input, nameEl) {
+    input.addEventListener('change', () => { nameEl.textContent = input.files[0]?.name || ''; });
+    ['dragenter','dragover'].forEach(e => zone.addEventListener(e, ev => { ev.preventDefault(); zone.classList.add('over'); }));
+    ['dragleave','drop'].forEach(e => zone.addEventListener(e, ev => { ev.preventDefault(); zone.classList.remove('over'); }));
+    zone.addEventListener('drop', ev => {
+      if (ev.dataTransfer.files.length) {
+        input.files = ev.dataTransfer.files;
+        nameEl.textContent = ev.dataTransfer.files[0].name;
+      }
+    });
+  }
+  setupDrop(document.getElementById('dropFace'),  faceIn,  faceName);
+  setupDrop(document.getElementById('dropAudio'), audioIn, audioName);
+
+  // ── Submit ──
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!faceIn.files.length || !audioIn.files.length) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Processing…';
+    status.className = 'status';
+    status.innerHTML = '<span class="spinner"></span>Generating lip-sync — this may take 1–5 min on CPU …';
+    result.style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('face',  faceIn.files[0]);
+    fd.append('audio', audioIn.files[0]);
+
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 10 * 60 * 1000); // 10 min
+
+    try {
+      const res = await fetch('/generate', { method: 'POST', body: fd, signal: controller.signal });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Unknown error');
+      }
+
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+
+      player.src = url;
+      result.style.display = 'block';
+
+      // Auto-download
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'lip_synced.mp4';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      status.className = 'status ok';
+      status.textContent = '✔ Done — video downloaded.';
+    } catch (err) {
+      status.className = 'status error';
+      if (err.name === 'AbortError') {
+        status.textContent = '✖ Request timed out (10 min). Try shorter audio or use a GPU.';
+      } else {
+        status.textContent = '✖ ' + err.message;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      btn.disabled = false;
+      btn.textContent = 'Generate Lip-Sync Video';
+    }
+  });
+})();
+</script>
+</body>
+</html>
