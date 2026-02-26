@@ -16,10 +16,14 @@ from pathlib import Path
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 CHECKPOINT = MODELS_DIR / "wav2lip_gan.pth"
 
-# Community HuggingFace mirror (most reliable for scripted downloads)
-HF_URL = (
-    "https://huggingface.co/numz/wav2lip_studio/resolve/main/Wav2Lip/wav2lip_gan.pth"
-)
+# Multiple mirrors — tried in order until one succeeds
+MIRROR_URLS = [
+    "https://huggingface.co/numz/wav2lip_studio/resolve/main/Wav2Lip/wav2lip_gan.pth",
+    "https://huggingface.co/camenduru/Wav2Lip/resolve/main/checkpoints/wav2lip_gan.pth",
+    "https://huggingface.co/Ian09/Wav2Lip/resolve/main/wav2lip_gan.pth",
+    "https://huggingface.co/sashahdo/Wav2Lip/resolve/main/wav2lip_gan.pth",
+    "https://huggingface.co/Klaas2000/Wav2Lip/resolve/main/wav2lip_gan.pth",
+]
 
 OFFICIAL_LINKS = """
 If the automatic download fails, download the model manually:
@@ -40,23 +44,34 @@ def download() -> None:
 
     if CHECKPOINT.exists():
         size_mb = CHECKPOINT.stat().st_size / (1024 * 1024)
-        print(f"✔ Model already exists at {CHECKPOINT} ({size_mb:.0f} MB)")
-        return
+        if size_mb > 100:  # valid checkpoint should be ~415 MB
+            print(f"✔ Model already exists at {CHECKPOINT} ({size_mb:.0f} MB)")
+            return
+        else:
+            print(f"⚠ Existing file too small ({size_mb:.1f} MB) — likely incomplete. Re-downloading…")
+            CHECKPOINT.unlink()
 
-    print(f"Downloading wav2lip_gan.pth from HuggingFace …")
-    print(f"  URL  → {HF_URL}")
-    print(f"  Dest → {CHECKPOINT}")
+    for i, url in enumerate(MIRROR_URLS, 1):
+        print(f"\n[{i}/{len(MIRROR_URLS)}] Trying: {url}")
+        print(f"  Dest → {CHECKPOINT}")
+        try:
+            urllib.request.urlretrieve(url, str(CHECKPOINT), _progress)
+            print()
+            size_mb = CHECKPOINT.stat().st_size / (1024 * 1024)
+            if size_mb < 100:   # too small = partial or HTML error page
+                print(f"  ✖ File too small ({size_mb:.1f} MB) — likely an error page. Skipping.")
+                CHECKPOINT.unlink(missing_ok=True)
+                continue
+            print(f"✔ Downloaded successfully ({size_mb:.0f} MB)")
+            return
+        except Exception as exc:
+            print(f"  ✖ Failed: {exc}")
+            CHECKPOINT.unlink(missing_ok=True)
 
-    try:
-        urllib.request.urlretrieve(HF_URL, str(CHECKPOINT), _progress)
-        print()
-        size_mb = CHECKPOINT.stat().st_size / (1024 * 1024)
-        print(f"✔ Downloaded successfully ({size_mb:.0f} MB)")
-    except Exception as exc:
-        print(f"\n✖ Download failed: {exc}")
-        print()
-        print(OFFICIAL_LINKS.format(checkpoint=CHECKPOINT))
-        sys.exit(1)
+    print()
+    print("All mirrors failed.")
+    print(OFFICIAL_LINKS.format(checkpoint=CHECKPOINT))
+    sys.exit(1)
 
 
 def _progress(block_num: int, block_size: int, total_size: int) -> None:

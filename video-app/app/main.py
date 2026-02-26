@@ -77,26 +77,43 @@ _device: Optional[torch.device] = None
 _executor = ThreadPoolExecutor(max_workers=1)
 
 
-def _load_wav2lip():
+def _load_wav2lip() -> bool:
+    """Try loading the model. Returns True on success, False if checkpoint missing."""
     global _model, _device
     if not CHECKPOINT.exists():
-        log.error(
+        log.warning(
             "Wav2Lip checkpoint NOT FOUND at %s.  "
             "Run: python scripts/download_models.py  "
-            "or download wav2lip_gan.pth manually.",
+            "or download wav2lip_gan.pth manually.  "
+            "The server will start, but /generate will return 503 until the model is available.",
             CHECKPOINT,
         )
-        raise FileNotFoundError(
-            f"Wav2Lip model not found at {CHECKPOINT}. "
-            "See README.md for download instructions."
-        )
+        return False
     _device = get_device()
     _model = load_model(str(CHECKPOINT), _device)
+    return True
+
+
+def _ensure_model():
+    """Raise 503 if model not loaded; attempt lazy-load once if checkpoint appeared."""
+    global _model
+    if _model is not None:
+        return
+    # Maybe user dropped the file in after startup
+    if CHECKPOINT.exists():
+        log.info("Checkpoint detected — loading Wav2Lip model now…")
+        _load_wav2lip()
+    if _model is None:
+        raise HTTPException(
+            503,
+            f"Wav2Lip model not loaded. Place wav2lip_gan.pth at {CHECKPOINT} "
+            "and restart, or it will auto-load on next request.",
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_wav2lip()
+    _load_wav2lip()          # best-effort; won't crash if missing
     yield
     log.info("Shutting down.")
 
@@ -295,6 +312,7 @@ async def generate_video(
     output_path: Optional[str] = None
 
     try:
+        _ensure_model()
         loop = asyncio.get_running_loop()
         output_path = await loop.run_in_executor(
             _executor, _run_pipeline, face_path, audio_path, is_img,

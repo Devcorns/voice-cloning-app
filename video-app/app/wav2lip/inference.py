@@ -7,6 +7,8 @@ Face detection → frame extraction → mel alignment → model inference → vi
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -254,6 +256,30 @@ def run_inference(
     return output_frames
 
 
+# ── FFmpeg locator ────────────────────────────────────────────────────────────
+
+def _find_ffmpeg() -> str:
+    """Return the absolute path to ffmpeg, searching PATH + common Windows locations."""
+    # 1. shutil.which checks PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 2. Common Windows install paths (winget, choco, manual)
+    candidates = [
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe",
+        Path("C:/ProgramData/chocolatey/bin/ffmpeg.exe"),
+        Path("C:/ffmpeg/bin/ffmpeg.exe"),
+        Path("C:/tools/ffmpeg/bin/ffmpeg.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    raise FileNotFoundError(
+        "ffmpeg not found on PATH or common locations. "
+        "Install it: winget install Gyan.FFmpeg  (then restart terminal)"
+    )
+
+
 # ── Video writing + audio merge ──────────────────────────────────────────────
 
 def write_video(
@@ -274,8 +300,9 @@ def write_video(
         writer.release()
         log.info("Wrote %d frames to temp AVI.", len(frames))
 
+        ffmpeg_bin = _find_ffmpeg()
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-i", tmp_video,
             "-i", audio_path,
             "-c:v", "libx264",
