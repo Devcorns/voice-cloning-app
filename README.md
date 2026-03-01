@@ -1,4 +1,4 @@
-# Voice Cloning Web App — XTTS v2
+# Voice Cloning Web App — XTTS v2 
 
 Minimal, stateless, local-only voice cloning powered by [Coqui TTS XTTS-v2](https://github.com/coqui-ai/TTS).
 
